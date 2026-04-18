@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision as tv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image
@@ -101,8 +102,12 @@ class CLIP(nn.Module):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+        vision_hidden_size = int(getattr(self.vision_encoder.config, "hidden_size"))
+        text_hidden_size = int(getattr(self.text_encoder.config, "hidden_size"))
+
+        self.vision_projection = nn.Linear(vision_hidden_size, proj_dim, bias=False)
+        self.text_projection = nn.Linear(text_hidden_size, proj_dim, bias=False)
+        self.logit_scale = nn.Parameter(torch.tensor(1.0 / max(temperature, 1e-6)).log())
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(image)
@@ -180,7 +185,27 @@ class CLIP(nn.Module):
         Returns:
             TODO: think about the what values should be returned
         """
-        raise NotImplementedError("Not implemented")
+        vision_outputs = self.vision_encoder(pixel_values=pixel_values)
+        vision_hidden = vision_outputs.last_hidden_state
+        if hasattr(vision_outputs, "pooler_output") and vision_outputs.pooler_output is not None:
+            vision_pooled = vision_outputs.pooler_output
+        else:
+            vision_pooled = vision_hidden.mean(dim=1)
+
+        text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        text_hidden = text_outputs.last_hidden_state
+        # Use hidden state at first EOS token position (avoids dilution from padding)
+        eos_token_id = processor.tokenizer.eos_token_id
+        eos_positions = (input_ids == eos_token_id).long().argmax(dim=1)
+        text_pooled = text_hidden[torch.arange(text_hidden.size(0), device=text_hidden.device), eos_positions]
+
+        vision_feature = F.normalize(self.vision_projection(vision_pooled), p=2, dim=-1)
+        text_feature = F.normalize(self.text_projection(text_pooled), p=2, dim=-1)
+
+        logits = vision_feature @ text_feature.T
+        logits = logits * self.logit_scale.exp().clamp(max=100)
+
+        return vision_feature, text_feature, logits
 
 
 def compute_clip_loss(
@@ -199,7 +224,23 @@ def compute_clip_loss(
     Returns:
         The loss for the CLIP model.
     """
-    raise NotImplementedError("Not implemented")
+    _, _, logits = outputs
+    if logits is None:
+        raise ValueError("CLIP forward must return logits for loss computation")
+
+    n_images, n_texts = logits.shape
+    if n_images == n_texts:
+        targets = torch.arange(n_images, device=logits.device)
+        loss_i = F.cross_entropy(logits, targets)
+        loss_t = F.cross_entropy(logits.T, targets)
+        return (loss_i + loss_t) / 2
+
+    # Fallback for non-square similarity matrices.
+    n = min(n_images, n_texts)
+    targets = torch.arange(n, device=logits.device)
+    loss_i = F.cross_entropy(logits[:n, :], targets)
+    loss_t = F.cross_entropy(logits[:, :n].T, targets)
+    return (loss_i + loss_t) / 2
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
@@ -218,7 +259,8 @@ def get_target_modules_for_lora(model: nn.Module) -> list[str]:
 
 def train(
     data_dir: Path | None = None,
-    output_dir: str = "clip",
+    train_dataset_name: str = "train",
+    output_dir: str = "clip_model",
     num_train_epochs: float = 0.05,  # for debugging purpose, increase this once the dry run works
     per_device_train_batch_size: int = 1024,
     gradient_accumulation_steps: int = 1,
@@ -259,7 +301,7 @@ def train(
     model.enable_input_require_grads()
 
     # load dataset
-    train_dataset = CaptionDataset("train", data_dir)
+    train_dataset = CaptionDataset(train_dataset_name, data_dir)
     train_dataset = CaptionDatasetForTraining(train_dataset, processor)
 
     training_args = TrainingArguments(
