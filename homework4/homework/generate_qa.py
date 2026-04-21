@@ -35,47 +35,70 @@ def _extract_kart_name_map(info: dict) -> dict[int, str]:
     """Best-effort extraction of track_id -> kart_name mapping from an info.json dict."""
     name_map: dict[int, str] = {}
 
-    candidate_keys = [
-        "karts",
-        "kart_info",
-        "kart_infos",
-        "players",
-        "player_info",
-        "racers",
-    ]
+    name_keys = ["kart_name", "name", "kart", "character", "player_name", "racer_name"]
+    id_keys = ["track_id", "instance_id", "id", "kart_id", "player_id", "racer_id"]
+    ego_keys = {"ego", "player", "racer"}
 
-    def maybe_add(entry: dict):
+    def maybe_add(entry: dict, default_id=None):
         if not isinstance(entry, dict):
             return
-        kart_name = entry.get("kart_name") or entry.get("name") or entry.get("kart")
-        kart_id = entry.get("track_id")
-        if kart_id is None:
-            kart_id = entry.get("instance_id")
-        if kart_id is None:
-            kart_id = entry.get("id")
+
+        kart_name = None
+        for key in name_keys:
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                kart_name = value.strip()
+                break
+
+        kart_id = None
+        for key in id_keys:
+            value = entry.get(key)
+            if value is not None:
+                kart_id = value
+                break
+
+        if kart_id is None and default_id is not None:
+            kart_id = default_id
+
         if kart_name is None or kart_id is None:
             return
+
         try:
             name_map[int(kart_id)] = str(kart_name)
         except (TypeError, ValueError):
             return
 
-    for key in candidate_keys:
-        value = info.get(key)
-        if isinstance(value, list):
-            for item in value:
-                maybe_add(item)
-        elif isinstance(value, dict):
-            for k, v in value.items():
-                if isinstance(v, dict):
-                    if "id" not in v:
-                        v = {"id": k, **v}
-                    maybe_add(v)
-                elif isinstance(v, str):
+    def visit(value, parent_key: str | None = None, default_id=None):
+        if isinstance(value, dict):
+            local_default_id = default_id
+            if parent_key in ego_keys:
+                local_default_id = 0
+
+            maybe_add(value, default_id=local_default_id)
+
+            for key, child in value.items():
+                child_default_id = local_default_id
+                if key in ego_keys:
+                    child_default_id = 0
+
+                if isinstance(child, str) and key in ego_keys and child.strip():
+                    name_map[0] = child.strip()
+                elif isinstance(child, str):
                     try:
-                        name_map[int(k)] = v
+                        name_map[int(key)] = child.strip()
                     except (TypeError, ValueError):
-                        continue
+                        pass
+                else:
+                    visit(child, parent_key=key, default_id=child_default_id)
+
+        elif isinstance(value, list):
+            for idx, item in enumerate(value):
+                if isinstance(item, str) and parent_key in {"karts", "players", "racers"} and item.strip():
+                    name_map[idx] = item.strip()
+                else:
+                    visit(item, parent_key=parent_key, default_id=default_id)
+
+    visit(info)
 
     return name_map
 
@@ -85,12 +108,8 @@ def _relative_position(ego_center: tuple[float, float], other_center: tuple[floa
     dy = other_center[1] - ego_center[1]
 
     left_right = "left" if dx < 0 else "right"
-    front_behind = "front" if dy < 0 else "behind"
-
-    if abs(dx) >= abs(dy):
-        coarse = left_right
-    else:
-        coarse = "in front of" if front_behind == "front" else "behind"
+    front_behind = "front" if dy < 0 else "back"
+    coarse = f"{front_behind} and {left_right}"
 
     return left_right, front_behind, coarse
 
@@ -116,10 +135,11 @@ def extract_frame_info(image_path: str) -> tuple[int, int]:
 
 
 def draw_detections(
-    image_path: str, info_path: str, font_scale: float = 0.5, thickness: int = 1, min_box_size: int = 5
+    image_path: str, info_path: str, font_scale: float = 0.5, thickness: int = 1, min_box_size: int = 19
 ) -> np.ndarray:
     """
     Draw detection bounding boxes and labels on the image.
+    Ego kart (track_id=0) is drawn in red, others in default color.
 
     Args:
         image_path: Path to the image file
@@ -169,24 +189,20 @@ def draw_detections(
         if class_id != 1:
             continue
 
+        if (x2 - x1) < min_box_size or (y2 - y1) < min_box_size:
+            continue
+
         # Scale coordinates to fit the current image size
         x1_scaled = int(x1 * scale_x)
         y1_scaled = int(y1 * scale_y)
         x2_scaled = int(x2 * scale_x)
         y2_scaled = int(y2 * scale_y)
 
-        # Skip if bounding box is too small
-        if (x2_scaled - x1_scaled) < min_box_size or (y2_scaled - y1_scaled) < min_box_size:
-            continue
-
         if x2_scaled < 0 or x1_scaled > img_width or y2_scaled < 0 or y1_scaled > img_height:
             continue
 
-        # Get color for this object type
-        if track_id == 0:
-            color = (255, 0, 0)
-        else:
-            color = COLORS.get(class_id, (255, 255, 255))
+        # Ego kart (track_id=0) is red, others are default color
+        color = (255, 0, 0) if track_id == 0 else COLORS.get(class_id, (255, 255, 255))
 
         # Draw bounding box using PIL
         draw.rectangle([(x1_scaled, y1_scaled), (x2_scaled, y2_scaled)], outline=color, width=thickness)
@@ -196,7 +212,7 @@ def draw_detections(
 
 
 def extract_kart_objects(
-    info_path: str, view_index: int, img_width: int = 150, img_height: int = 100, min_box_size: int = 5
+    info_path: str, view_index: int, img_width: int = 150, img_height: int = 100, min_box_size: int = 19
 ) -> list:
     """
     Extract kart objects from the info.json file, including their center points and identify the center kart.
@@ -240,22 +256,22 @@ def extract_kart_objects(
         if class_id != 1:
             continue
 
+        if (x2 - x1) < min_box_size or (y2 - y1) < min_box_size:
+            continue
+
         x1_scaled = float(x1) * scale_x
         y1_scaled = float(y1) * scale_y
         x2_scaled = float(x2) * scale_x
         y2_scaled = float(y2) * scale_y
 
-        if (x2_scaled - x1_scaled) < min_box_size or (y2_scaled - y1_scaled) < min_box_size:
-            continue
-
         center_x = (x1_scaled + x2_scaled) / 2
         center_y = (y1_scaled + y2_scaled) / 2
 
-        if center_x < 0 or center_x >= img_width or center_y < 0 or center_y >= img_height:
+        # Keep only karts fully visible in the image.
+        if x1_scaled < 0 or y1_scaled < 0 or x2_scaled > img_width or y2_scaled > img_height:
             continue
 
-        kart_name = kart_name_map.get(track_id, "ego" if track_id == 0 else f"kart_{track_id}")
-
+        kart_name = kart_name_map.get(track_id, f"kart_{track_id}")
         karts.append(
             {
                 "instance_id": track_id,
@@ -270,17 +286,15 @@ def extract_kart_objects(
 
     image_center = (img_width / 2, img_height / 2)
 
-    # Prefer id=0 (ego) when available; otherwise use geometric center heuristic.
-    ego_idx = next((i for i, k in enumerate(karts) if int(k["instance_id"]) == 0), None)
-    if ego_idx is None:
-        ego_idx = int(
-            np.argmin(
-                [
-                    (k["center"][0] - image_center[0]) ** 2 + (k["center"][1] - image_center[1]) ** 2
-                    for k in karts
-                ]
-            )
+    # Ego is defined as the kart whose bbox center is closest to image center.
+    ego_idx = int(
+        np.argmin(
+            [
+                (k["center"][0] - image_center[0]) ** 2 + (k["center"][1] - image_center[1]) ** 2
+                for k in karts
+            ]
         )
+    )
 
     karts[ego_idx]["is_center_kart"] = True
     return karts
@@ -403,7 +417,7 @@ def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img
         qa_pairs.append(
             {
                 "question": f"Is {kart_name} in front of or behind the ego car?",
-                "answer": front_behind,
+                "answer": "front" if front_behind == "front" else "back",
             }
         )
         qa_pairs.append(
@@ -527,8 +541,82 @@ You probably need to add additional commands to Fire below.
 """
 
 
+def validate(
+    data_dir: str = "data/valid_grader",
+    ground_truth_file: str = "data/valid_grader/balanced_qa_pairs.json",
+    max_mismatches: int = 30,
+    img_width: int = 150,
+    img_height: int = 100,
+):
+    """
+    Validate generated QA pairs against a ground truth file.
+
+    Args:
+        data_dir: Directory containing *_info.json files for generation.
+        ground_truth_file: Path to the ground truth balanced_qa_pairs.json.
+        max_mismatches: Maximum number of mismatches to display.
+        img_width: Width used for coordinate scaling.
+        img_height: Height used for coordinate scaling.
+    """
+    import json
+    from pathlib import Path
+
+    # Load ground truth
+    with open(ground_truth_file) as f:
+        ground_truth = json.load(f)
+
+    # Build a lookup: (image_file, question) -> expected answer
+    gt_lookup: dict[tuple[str, str], str] = {}
+    for item in ground_truth:
+        key = (item["image_file"], item["question"])
+        gt_lookup[key] = item["answer"]
+
+    # Generate QA pairs from data_dir
+    split_dir = Path(data_dir)
+    # Derive image_file prefix from ground truth (e.g. "valid") rather than dir name (e.g. "valid_grader")
+    split_name = next(iter(gt_lookup))[0].split("/")[0] if gt_lookup else split_dir.name
+    info_files = sorted(split_dir.glob("*_info.json"))
+
+    generated: dict[tuple[str, str], str] = {}
+    for info_path in info_files:
+        with open(info_path) as f:
+            info = json.load(f)
+        num_views = len(info.get("detections", []))
+        base_name = info_path.stem.replace("_info", "")
+        for view_index in range(num_views):
+            image_name = f"{base_name}_{view_index:02d}_im.jpg"
+            image_path = split_dir / image_name
+            if not image_path.exists():
+                continue
+            image_file = f"{split_name}/{image_name}"
+            qa_pairs = generate_qa_pairs(str(info_path), view_index, img_width=img_width, img_height=img_height)
+            for qa in qa_pairs:
+                generated[(image_file, qa["question"])] = qa["answer"]
+
+    # Compare
+    matched = 0
+    mismatches = []
+    for (image_file, question), expected in gt_lookup.items():
+        got = generated.get((image_file, question))
+        if got == expected:
+            matched += 1
+        else:
+            mismatches.append((image_file, question, expected, got))
+
+    total = len(gt_lookup)
+    print(f"\nGrader validation: {matched}/{total} match ({100 * matched / total:.1f}%)")
+
+    if mismatches:
+        print(f"\nMismatches ({len(mismatches)} total, showing up to {max_mismatches}):")
+        for image_file, question, expected, got in mismatches[:max_mismatches]:
+            print(f"  {image_file}  Q: {question}")
+            print(f"    expected: '{expected}'  got: '{got}'")
+    else:
+        print("\nAll match!")
+
+
 def main():
-    fire.Fire({"check": check_qa_pairs, "generate": generate})
+    fire.Fire({"check": check_qa_pairs, "generate": generate, "validate": validate})
 
 
 if __name__ == "__main__":

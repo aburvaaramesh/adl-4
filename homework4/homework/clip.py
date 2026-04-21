@@ -194,10 +194,23 @@ class CLIP(nn.Module):
 
         text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         text_hidden = text_outputs.last_hidden_state
-        # Use hidden state at first EOS token position (avoids dilution from padding)
-        eos_token_id = processor.tokenizer.eos_token_id
-        eos_positions = (input_ids == eos_token_id).long().argmax(dim=1)
-        text_pooled = text_hidden[torch.arange(text_hidden.size(0), device=text_hidden.device), eos_positions]
+        # Masked average pooling: only average over non-padded tokens
+        if attention_mask is not None:
+            # attention_mask: (batch_size, seq_length), 1 for real tokens, 0 for padding
+            mask_expanded = attention_mask.unsqueeze(-1).to(text_hidden.dtype)  # (batch, seq, 1)
+            # (batch, seq, hidden) * (batch, seq, 1) -> (batch, seq, hidden), zeros out padding
+            masked_hidden = text_hidden * mask_expanded
+            # Sum over sequence dimension
+            sum_hidden = masked_hidden.sum(dim=1)  # (batch, hidden)
+            # Count non-padding tokens per sample
+            token_counts = attention_mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # (batch, 1)
+            text_pooled = sum_hidden / token_counts  # (batch, hidden)
+        else:
+            text_pooled = text_hidden.mean(dim=1)
+
+        # Ensure dtype consistency for projection layers
+        vision_pooled = vision_pooled.to(self.vision_projection.weight.dtype)
+        text_pooled = text_pooled.to(self.text_projection.weight.dtype)
 
         vision_feature = F.normalize(self.vision_projection(vision_pooled), p=2, dim=-1)
         text_feature = F.normalize(self.text_projection(text_pooled), p=2, dim=-1)
@@ -261,11 +274,11 @@ def train(
     data_dir: Path | None = None,
     train_dataset_name: str = "train",
     output_dir: str = "clip_model",
-    num_train_epochs: float = 0.05,  # for debugging purpose, increase this once the dry run works
-    per_device_train_batch_size: int = 1024,
+    num_train_epochs: float = 0.25,
+    per_device_train_batch_size: int = 256,
     gradient_accumulation_steps: int = 1,
     learning_rate: float = 5e-4,
-    num_workers: int = 16,
+    num_workers: int = 2,
 ):
     vlm = BaseVLM()
 
@@ -280,7 +293,9 @@ def train(
     # Initialize model and processor
     vision_encoder = vlm.model.model.vision_model
     text_encoder = vlm.model.model.text_model
-    model = CLIP(vision_encoder, text_encoder).to(device).bfloat16()
+    model = CLIP(vision_encoder, text_encoder).to(device)
+    if device == "cuda":
+        model = model.to(dtype=torch.bfloat16)
     model.set_trainable_parameters()
 
     peft_config = LoraConfig(
@@ -314,7 +329,7 @@ def train(
         gradient_checkpointing=True,
         learning_rate=learning_rate,
         bf16=True if device == "cuda" else False,
-        logging_steps=1,
+        logging_steps=20,
         save_strategy="steps",
         save_steps=50,
         save_total_limit=2,
@@ -375,7 +390,9 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
 
     for pair in tqdm.tqdm(testset):
         image = Image.open(pair["image_path"]).convert("RGB")
-        pixel_values = image_processor(image).unsqueeze(0).to(device).bfloat16()
+        pixel_values = image_processor(image).unsqueeze(0).to(device)
+        if device == "cuda":
+            pixel_values = pixel_values.to(dtype=torch.bfloat16)
         text_inputs = processor(
             text=[s + processor.tokenizer.eos_token for s in pair["candidates"]],
             return_tensors="pt",
